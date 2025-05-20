@@ -1,13 +1,59 @@
-import socket
+import json
 import asyncio
 import time
 
 HOST = '127.0.0.1'  
 PORT = 6400
+FILENAME="dump.rdb"
 
 cache={}
 lock={}
 expirations={}
+
+class Node:
+    def __init__(self,value):
+        self.value=value
+        self.next=None
+
+class List:
+    def __init__(self):
+        self.head=None
+        self.tail=None
+    
+    def append(self,value):
+        if self.tail is None:
+            self.tail=Node(value)
+            self.head=self.tail
+        else:
+            node=Node(value)
+            self.tail.next=node
+            self.tail=node
+    
+    def prepend(self,value):
+        if self.head is None:
+            self.head=Node(value)
+            self.tail=self.head
+        else:
+            node=Node(value)
+            node.next=self.head
+            self.head=node
+
+    def getlen(self):
+        curr=self.head
+        count=0
+        while curr!=None:
+            count+=1
+            curr=curr.next
+        return count
+    
+    def getRangeValues(self,start,end):
+        index=start
+        curr=self.head
+        values=[]
+        while curr != None and index<=end:
+            values.append(curr.value)
+            curr=curr.next
+        return values
 
 async def get_lock(key):
     if key not in lock:
@@ -40,16 +86,74 @@ async def delete_key(keys):
 
 async def increment_key(key):
     if key not in cache:
-        with get_lock(key):
+        async with await get_lock(key):
             cache[key]="1"
-            return f":{cache[key]}"
+            return f":{cache[key]}\r\n"
     else:
         try:
-            with get_lock(key):
+            async with await get_lock(key):
                 cache[key]=str(int(cache[key])+1)
-                return f":{cache[key]}"
+                return f":{cache[key]}\r\n"
         except:
-            return f"-ERR value is not an integer or out of range"
+            return f"-ERR value is not an integer or out of range\r\n"
+
+async def decrement_key(key):
+    if key not in cache:
+        async with await get_lock(key):
+            cache[key]="-1"
+            return f":{cache[key]}\r\n"
+    else:
+        try:
+            async with await get_lock(key):
+                cache[key]=str(int(cache[key])-1)
+                return f":{cache[key]}\r\n"
+        except:
+            return f"-ERR value is not an integer or out of range\r\n"
+
+async def lpush_values(key,values,lpush):
+    async with await get_lock(key):
+        if key not in cache:
+            cache[key]=List()
+        if lpush:
+            for value in values:
+                cache[key].prepend(value)
+        else:
+            for value in values:
+                cache[key].append(value) 
+        return f":{cache[key].getlen()}\r\n"
+
+def save_contents(filename):
+    with open(filename) as f:
+        data={
+            "cache":cache,
+            "expirations":expirations
+        }
+        json.dump(data,f)
+        return "+OK\r\n"
+
+def load_contents(filename):
+    with open(filename) as f:
+        data=json.load(f)
+        cache=data.get("cache",{})
+        expirations=data.get("expirations",{})
+        return cache,expirations
+    return {},{}
+
+def lrange(key,start,end):
+    if key not in cache:
+        return "*0\r\n\r\n"
+    try:
+        length=cache[key].getlen()
+        if end<0:
+            end=length+end
+        values=cache[key].getRangeValues(start,end)
+        returnString=f"*{len(values)}\r\n"
+        for value in values:
+            returnString+=f"${len(value)}\r\n{value}\r\n"
+        return returnString
+    except Exception as e:
+        print(e)
+        return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
 
 async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_condition=False,if_exists_condition=False):
     async with await get_lock(key):
@@ -188,7 +292,7 @@ async def handle_command(args):
             else:
                 return "-ERR Invalid command syntax"
             if existence=="XX" and unix_flag:
-                respone=await set_key(args[1],args[2],exact_time=time_value,if_exists_condition=True)
+                response=await set_key(args[1],args[2],exact_time=time_value,if_exists_condition=True)
             elif existence=="NX" and unix_flag:
                 response=await set_key(args[1],args[2],exact_time=time_value,not_exists_condition=True)
             elif existence=="XX":
@@ -200,6 +304,30 @@ async def handle_command(args):
     elif command.upper()=='GET' and len(args)==2:
         response=await get_key(args[1])
         return response
+    elif command.upper()=="EXISTS" and len(args)>=2:
+        keys=[args[index] for index in range(1,len(args))]
+        response=key_exists(keys)
+        return response
+    elif command.upper()=="DEL" and len(args)>=2:
+        keys=[args[index] for index in range(1,len(args))]
+        response=await delete_key(keys)
+        return response
+    elif command.upper()=="ICR" and len(args)==2:
+        response=await increment_key(args[1])
+        return response
+    elif command.upper()=="DCR" and len(args)==2:
+        response=await decrement_key(args[1])
+        return response
+    elif command.upper()=="LPUSH" and len(args)>=3:
+        values=[args[index] for index in range(2,len(args))]
+        response=await lpush_values(args[1],values,True)
+        return response
+    elif command.upper()=="RPUSH" and len(args)>=3:
+        values=[args[index] for index in range(2,len(args))]
+        response=await lpush_values(args[1],values,False)
+        return response
+    elif command.upper()=="LRANGE" and len(args)==4:
+        return lrange(args[1],int(args[2]),int(args[3]))
     else:
         return '-ERR unknown command\r\n'
 
