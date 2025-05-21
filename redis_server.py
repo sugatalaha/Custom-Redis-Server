@@ -1,6 +1,7 @@
 import json
 import asyncio
 import time
+import os
 
 HOST = '127.0.0.1'  
 PORT = 6400
@@ -9,6 +10,7 @@ FILENAME="dump.rdb"
 cache={}
 lock={}
 expirations={}
+expiration_time={}
 
 class Node:
     def __init__(self,value):
@@ -45,6 +47,16 @@ class List:
             count+=1
             curr=curr.next
         return count
+
+    def to_dict(self):
+        list_dict={}
+        list_dict["type"]="List"
+        list_dict["items"]=[]
+        curr=self.head
+        while curr!= None:
+            list_dict["items"].append(curr.value)
+            curr=curr.next
+        return list_dict
     
     def getRangeValues(self,start,end):
         index=start
@@ -65,6 +77,7 @@ async def expire_key_after(key,ex_seconds):
         await asyncio.sleep(ex_seconds)
         cache.pop(key,None)
         expirations.pop(key,None)
+        expiration_time.pop(key,None)
     except Exception as e:
         print(e)
 
@@ -123,21 +136,45 @@ async def lpush_values(key,values,lpush):
         return f":{cache[key].getlen()}\r\n"
 
 def save_contents(filename):
-    with open(filename) as f:
+    def serialize_object(o):
+        if hasattr(o,"to_dict"):
+            return o.to_dict()
+        else:
+            return TypeError(f"Object of type {type(o).__name__} is not serializable")
+    with open(filename,"w") as f:
         data={
             "cache":cache,
-            "expirations":expirations
+            "expiration_time":expiration_time
         }
-        json.dump(data,f)
+        json.dump(data,f,default=serialize_object)
         return "+OK\r\n"
 
 def load_contents(filename):
-    with open(filename) as f:
-        data=json.load(f)
-        cache=data.get("cache",{})
-        expirations=data.get("expirations",{})
-        return cache,expirations
-    return {},{}
+    def from_dict(d):
+        if (d.get("type")=="List"):
+            custom_list=List()
+            for value in d.get("items"):
+                custom_list.append(value)
+            return custom_list
+        return d
+    if os.path.exists(filename):
+        with open(filename) as f:
+            data=json.load(f,object_hook=from_dict)
+            cache=data.get("cache",{})
+            expiration_time=data.get("expiration_time",{})
+            expirations={}
+            to_delete_keys=[]
+            for key,time_of_expire in expiration_time.items():
+                delay=time_of_expire-time.time()
+                if delay<=0:
+                    to_delete_keys.append(key)
+                else:
+                    expirations[key]=asyncio.create_task(expire_key_after(key,delay))
+            for key in to_delete_keys:
+                cache.pop(key,None)
+                expiration_time.pop(key,None)
+            return cache,expiration_time,expirations
+    return {},{},{}
 
 def lrange(key,start,end):
     if key not in cache:
@@ -163,6 +200,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
             cache[key]=value
             if expiration_timer is not None:
                 expirations[key]=asyncio.create_task(expire_key_after(key,expiration_timer))
+                expiration_time[key]=time.time()+expiration_timer
             elif exact_time is not None:
                 current_time=time.time()
                 delay=exact_time-current_time
@@ -173,6 +211,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
                     if key in expirations:
                         expirations[key].cancel()
                         expirations[key]=asyncio.create_task(expire_key_after(key,delay))
+                        expiration_time[key]=exact_time
         elif not_exists_condition:
             if key not in cache:
                 if key in expirations:
@@ -180,6 +219,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
                 cache[key]=value
                 if expiration_timer is not None:
                     expirations[key]=asyncio.create_task(expire_key_after(key,expiration_timer))
+                    expiration_time[key]=time.time()+expiration_timer
                 elif exact_time is not None:
                     current_time=time.time()
                     delay=exact_time-current_time
@@ -190,6 +230,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
                         if key in expirations:
                             expirations[key].cancel()
                             expirations[key]=asyncio.create_task(expire_key_after(key,delay))
+                            expiration_time[key]=exact_time
         elif if_exists_condition:
             if key in cache:
                 if key in expirations:
@@ -197,6 +238,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
                 cache[key]=value
                 if expiration_timer is not None:
                     expirations[key]=asyncio.create_task(expire_key_after(key,expiration_timer))
+                    expiration_time[key]=time.time()+expiration_timer
                 elif exact_time is not None:
                     current_time=time.time()
                     delay=exact_time-current_time
@@ -207,6 +249,7 @@ async def set_key(key,value,expiration_timer=None,exact_time=None,not_exists_con
                         if key in expirations:
                             expirations[key].cancel()
                             expirations[key]=asyncio.create_task(expire_key_after(key,delay))
+                            expiration_time[key]=exact_time
         return "+OK\r\n"
 
 async def get_key(key):
@@ -328,6 +371,9 @@ async def handle_command(args):
         return response
     elif command.upper()=="LRANGE" and len(args)==4:
         return lrange(args[1],int(args[2]),int(args[3]))
+    elif command.upper()=="SAVE" and len(args)==1:
+        response=save_contents(FILENAME)
+        return response
     else:
         return '-ERR unknown command\r\n'
 
@@ -350,6 +396,10 @@ async def handle_client(reader,writer):
     await writer.wait_closed()
 
 async def main():
+    global cache
+    global expiration_time
+    global expirations
+    cache,expiration_time,expirations=load_contents(FILENAME)
     server=await asyncio.start_server(handle_client,host=HOST,port=PORT)
     addr=server.sockets[0].getsockname()
     print(f"Server listening on {addr}")
